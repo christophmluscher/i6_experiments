@@ -1,4 +1,5 @@
 __all__ = [
+    "ReturnnRasrTrainingArgs",
     "ReturnnRasrDataInput",
     "OggZipHdfDataInput",
     "HybridArgs",
@@ -8,10 +9,12 @@ __all__ = [
     "SeqDiscTrainArgs",
 ]
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple, Type, TypedDict, Union
 
 from sisyphus import tk
+from sisyphus.delayed_ops import DelayedFormat
 
 import i6_core.am as am
 import i6_core.rasr as rasr
@@ -32,9 +35,47 @@ from .rasr.config.lm_config import (
 RasrCacheTypes = Union[tk.Path, str, MultiPath, rasr.FlagDependentFlowAttribute]
 
 
+@dataclass(frozen=True)
+class ReturnnRasrTrainingArgs:
+    """
+    Options for writing a RASR training config. See `ReturnnRasrTrainingJob`.
+    Most of them may be disregarded, i.e. the defaults can be left untouched.
+
+    :param partition_epochs: if >1, split the full dataset into multiple sub-epochs
+    :param num_classes: number of classes
+    :param disregarded_classes: path to file with list of disregarded classes
+    :param class_label_file: path to file with class labels
+    :param buffer_size: buffer size for data loading
+    :param extra_rasr_config: extra RASR config
+    :param extra_rasr_post_config: extra RASR post config
+    :param use_python_control: whether to use python control, usually True
+    """
+
+    partition_epochs: Optional[int] = None
+    num_classes: Optional[int] = None
+    disregarded_classes: Optional[tk.Path] = None
+    class_label_file: Optional[tk.Path] = None
+    buffer_size: int = 200 * 1024
+    extra_rasr_config: Optional[rasr.RasrConfig] = None
+    extra_rasr_post_config: Optional[rasr.RasrConfig] = None
+    use_python_control: bool = True
+
+
 class ReturnnRasrDataInput:
     """
     Holds the data for ReturnnRasrTrainingJob.
+
+    :param name: name of the data
+    :param crp: common RASR parameters
+    :param alignments: RASR cache of an alignment
+    :param feature_flow: acoustic feature flow network or dict of feature flow networks
+    :param features: RASR cache of acoustic features
+    :param acoustic_mixtures: path to a RASR acoustic mixture file (used in System classes, not RETURNN training)
+    :param feature_scorers: RASR feature scorers
+    :param shuffle_data: shuffle training segments into bins of similar length. The bins are sorted by length.
+    :param stm: stm file for scoring
+    :param glm: glm file for scoring
+    :param returnn_rasr_training_args: arguments for RETURNN training with RASR
     """
 
     def __init__(
@@ -46,9 +87,10 @@ class ReturnnRasrDataInput:
         features: Optional[Union[RasrCacheTypes, Dict[str, RasrCacheTypes]]] = None,
         acoustic_mixtures: Optional[Union[tk.Path, str]] = None,
         feature_scorers: Optional[Dict[str, Type[rasr.FeatureScorer]]] = None,
-        shuffle_data: bool = True,
+        shuffling_parameters: Optional[Dict] = None,
         stm: Optional[tk.Path] = None,
         glm: Optional[tk.Path] = None,
+        returnn_rasr_training_args: Optional[ReturnnRasrTrainingArgs] = None,
         **kwargs,
     ):
         self.name = name
@@ -58,18 +100,39 @@ class ReturnnRasrDataInput:
         self.features = features
         self.acoustic_mixtures = acoustic_mixtures
         self.feature_scorers = feature_scorers
-        self.shuffle_data = shuffle_data
+        self.shuffling_parameters = shuffling_parameters
         self.stm = stm
         self.glm = glm
+        self.returnn_rasr_training_args = returnn_rasr_training_args or ReturnnRasrTrainingArgs()
 
-    @staticmethod
-    def get_data_dict():
-        return {
+    def get_training_feature_flow_file(self) -> tk.Path:
+        """Returns the feature flow file for the RETURNN training with RASR."""
+        feature_flow = returnn.ReturnnRasrTrainingJob.create_flow(self.feature_flow, self.alignments)
+        write_feature_flow = rasr.WriteFlowNetworkJob(feature_flow)
+        return write_feature_flow.out_flow_file
+
+    def get_training_rasr_config_file(self) -> tk.Path:
+        """Returns the RASR config file for the RETURNN training with RASR."""
+        config, post_config = returnn.ReturnnRasrTrainingJob.create_config(
+            self.crp, self.alignments, **asdict(self.returnn_rasr_training_args)
+        )
+        config.neural_network_trainer.feature_extraction.file = self.get_training_feature_flow_file()
+        write_rasr_config = rasr.WriteRasrConfigJob(config, post_config)
+        return write_rasr_config.out_config
+
+    def get_data_dict(self) -> Dict[str, Union[str, DelayedFormat, tk.Path]]:
+        """Returns the data dict for the ExternSprintDataset to be used in a training ReturnnConfig."""
+        config_file = self.get_training_rasr_config_file()
+        config_str = DelayedFormat("--config={} --*.LOGFILE=nn-trainer.{}.log --*.TASK=1", config_file, self.name)
+        dataset = {
             "class": "ExternSprintDataset",
-            "sprintTrainerExecPath": "sprint-executables/nn-trainer",
-            "sprintConfigStr": "",
-            "suppress_load_seqs_print": True,
+            "sprintTrainerExecPath": rasr.RasrCommand.select_exe(self.crp.nn_trainer_exe, "nn-trainer"),
+            "sprintConfigStr": config_str,
         }
+        partition_epochs = self.returnn_rasr_training_args.partition_epochs
+        if partition_epochs is not None:
+            dataset["partitionEpoch"] = partition_epochs
+        return dataset
 
     def build_crp(
         self,
@@ -116,6 +179,15 @@ class ReturnnRasrDataInput:
 
         self.crp = crp
 
+    def update_crp_with_shuffle_parameters(self):
+        if self.shuffling_parameters["shuffle_data"]:
+            self.crp.corpus_config.segment_order_shuffle = True
+        if "segment_order_sort_by_time_length_chunk_size" in self.shuffling_parameters:
+            self.crp.corpus_config.segment_order_sort_by_time_length = True
+            self.crp.corpus_config.segment_order_sort_by_time_length_chunk_size = self.shuffling_parameters[
+                "segment_order_sort_by_time_length_chunk_size"
+            ]
+
     def update_crp_with(
         self,
         *,
@@ -124,7 +196,7 @@ class ReturnnRasrDataInput:
         corpus_duration: Optional[int] = None,
         segment_path: Optional[Union[str, tk.Path]] = None,
         concurrent: Optional[int] = None,
-        shuffle_data: bool = True,
+        shuffling_paramters: Dict = None,
     ):
         if corpus_file is not None:
             self.crp.corpus_config.file = corpus_file
@@ -136,11 +208,12 @@ class ReturnnRasrDataInput:
             self.crp.segment_path = segment_path
         if concurrent is not None:
             self.crp.concurrent = concurrent
-
-        if self.shuffle_data or shuffle_data:
-            self.crp.corpus_config.segment_order_shuffle = True
-            self.crp.corpus_config.segment_order_sort_by_time_length = True
-            self.crp.corpus_config.segment_order_sort_by_time_length_chunk_size = 384
+        if self.shuffling_parameters is not None:
+            assert (
+                "shuffle_data" in self.shuffle_parameters or "shuffle_data" in shuffle_parameters
+            ), "You need to set at least the shuffle_data"
+            self.shuffling_parameters = shuffling_paramters
+            self.update_crp_with_shuffle_parameters()
 
     def get_crp(self, **kwargs) -> rasr.CommonRasrParameters:
         """
@@ -150,10 +223,8 @@ class ReturnnRasrDataInput:
         if self.crp is None:
             self.build_crp(**kwargs)
 
-        if self.shuffle_data:
-            self.crp.corpus_config.segment_order_shuffle = True
-            self.crp.corpus_config.segment_order_sort_by_time_length = True
-            self.crp.corpus_config.segment_order_sort_by_time_length_chunk_size = 384
+        if self.shuffling_parameters is not None:
+            self.update_crp_with_shuffle_parameters()
 
         return self.crp
 
@@ -162,44 +233,46 @@ class OggZipHdfDataInput:
     def __init__(
         self,
         oggzip_files: List[tk.Path],
-        alignments: tk.Path,
-        context_window: Dict,
+        alignments: List[tk.Path],
         audio: Dict,
-        targets: Optional[str] = None,
         partition_epoch: int = 1,
         seq_ordering: str = "laplace:.1000",
+        meta_args: Optional[Dict[str, Any]] = None,
         ogg_args: Optional[Dict[str, Any]] = None,
+        hdf_args: Optional[Dict[str, Any]] = None,
         acoustic_mixtures: Optional[tk.Path] = None,
     ):
         """
-        :param oggzip_files:
-        :param alignments:
-        :param context_window: {"classes": 1, "data": 242}
+        :param oggzip_files: zipped ogg files which contain the audio
+        :param alignments: hdf files which contain dumped RASR alignments
         :param audio: e.g. {"features": "raw", "sample_rate": 16000} for raw waveform input with a sample rate of 16 kHz
-        :param partition_epoch:
-        :param seq_ordering:
-        :param targets:
+        :param partition_epoch: if >1, split the full dataset into multiple sub-epochs
+        :param seq_ordering: sort the sequences in the dataset, e.g. "random" or "laplace:.100"
+        :param meta_args: parameters for the `MetaDataset`
+        :param ogg_args: parameters for the `OggZipDataset`
+        :param hdf_args: parameters for the `HdfDataset`
+        :param acoustic_mixtures: path to a RASR acoustic mixture file (used in System classes, not RETURNN training)
         """
         self.oggzip_files = oggzip_files
         self.alignments = alignments
-        self.context_window = context_window
         self.audio = audio
         self.partition_epoch = partition_epoch
         self.seq_ordering = seq_ordering
-        self.targets = targets
+        self.meta_args = meta_args
         self.ogg_args = ogg_args
+        self.hdf_args = hdf_args
         self.acoustic_mixtures = acoustic_mixtures
 
     def get_data_dict(self):
         return {
             "class": "MetaDataset",
-            "context_window": self.context_window,
             "data_map": {"classes": ("hdf", "classes"), "data": ("ogg", "data")},
             "datasets": {
                 "hdf": {
                     "class": "HDFDataset",
-                    "files": [self.alignments.get_path()],
+                    "files": self.alignments,
                     "use_cache_manager": True,
+                    **(self.hdf_args or {}),
                 },
                 "ogg": {
                     "class": "OggZipDataset",
@@ -207,12 +280,12 @@ class OggZipHdfDataInput:
                     "partition_epoch": self.partition_epoch,
                     "path": self.oggzip_files,
                     "seq_ordering": self.seq_ordering,
-                    "targets": self.targets,
                     "use_cache_manager": True,
                     **(self.ogg_args or {}),
                 },
             },
             "seq_order_control_dataset": "ogg",
+            **(self.meta_args or {}),
         }
 
 

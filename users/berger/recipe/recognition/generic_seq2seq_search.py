@@ -13,7 +13,7 @@ from i6_core import rasr, util
 class GenericSeq2SeqLmImageAndGlobalCacheJob(rasr.RasrCommand, Job):
     def __init__(
         self,
-        crp,
+        crp: rasr.CommonRasrParameters,
         label_tree,
         label_scorer,
         extra_config=None,
@@ -123,7 +123,7 @@ class GenericSeq2SeqLmImageAndGlobalCacheJob(rasr.RasrCommand, Job):
         extra_config=None,
         extra_post_config=None,
         default_search=False,
-        **kwargs
+        **kwargs,
     ):
         # get config from csp #
         config, post_config = rasr.build_config_from_mapping(
@@ -234,7 +234,7 @@ class GenericSeq2SeqSearchJob(rasr.RasrCommand, Job):
         sprint_exe=None,  # allow separat executable than default settings
         lm_gc_job=None,
         lm_gc_job_local=False,
-        lm_gc_job_mem=8,
+        lm_gc_job_mem=16,
         lm_gc_job_default_search=False,
     ):  # TODO set this to true later
         self.set_vis_name("Generic Seq2Seq Search")
@@ -326,9 +326,8 @@ class GenericSeq2SeqSearchJob(rasr.RasrCommand, Job):
         lm_gc_job_local=True,
         lm_gc_job_mem=6,
         lm_gc_job_default_search=False,
-        **kwargs
+        **kwargs,
     ):
-
         # optional individual lm-image and global-cache job #
         if lm_gc_job is None:
             lm_gc_job = GenericSeq2SeqLmImageAndGlobalCacheJob(

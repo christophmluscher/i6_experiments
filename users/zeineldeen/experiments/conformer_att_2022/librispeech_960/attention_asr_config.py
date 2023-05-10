@@ -1,6 +1,8 @@
+import os.path
+
 import numpy
 import copy
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from dataclasses import dataclass, asdict
 
 from i6_experiments.users.zeineldeen.models.asr.encoder.conformer_encoder import ConformerEncoder
@@ -8,6 +10,12 @@ from i6_experiments.users.zeineldeen.models.asr.decoder.transformer_decoder impo
 from i6_experiments.users.zeineldeen.models.asr.decoder.conformer_decoder import ConformerDecoder
 from i6_experiments.users.zeineldeen.models.asr.decoder.rnn_decoder import RNNDecoder
 from i6_experiments.users.zeineldeen.models.lm.external_lm_decoder import ExternalLMDecoder
+from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.librispeech_960.search_helpers import (
+    add_joint_ctc_att_subnet,
+    add_filter_blank_and_merge_labels_layers,
+    create_ctc_greedy_decoder,
+    update_tensor_entry,
+)
 
 from i6_experiments.users.zeineldeen import data_aug
 from i6_experiments.users.zeineldeen.data_aug import specaugment
@@ -131,6 +139,8 @@ def pretrain_layers_and_dims(
     second_bs_idx=None,
     enc_dec_share_grow_frac=True,
     repeat_first=True,
+    ignored_keys_for_reduce_dim=None,
+    extra_net_dict_override=None,
 ):
     """
     Pretraining implementation that works for multiple encoder/decoder combinations
@@ -174,6 +184,9 @@ def pretrain_layers_and_dims(
             if idx < second_bs_idx:
                 extra_net_dict["#config"]["batch_size"] = second_bs
 
+    if extra_net_dict_override:
+        extra_net_dict["#config"].update(extra_net_dict_override)
+
     if repeat_first:
         idx = max(idx - 1, 0)  # repeat first 0, 0, 1, 2, ...
 
@@ -215,6 +228,8 @@ def pretrain_layers_and_dims(
         dim_frac_enc = InitialDimFactor + (1.0 - InitialDimFactor) * grow_frac_enc
 
         for key in encoder_keys:
+            if ignored_keys_for_reduce_dim and key in ignored_keys_for_reduce_dim:
+                continue
             encoder_args_copy[key] = (
                 int(encoder_args[key] * dim_frac_enc / float(EncoderAttNumHeads)) * EncoderAttNumHeads
             )
@@ -237,6 +252,8 @@ def pretrain_layers_and_dims(
                 decoder_keys += ["conv_kernel_size"]
 
             for key in decoder_keys:
+                if ignored_keys_for_reduce_dim and key in ignored_keys_for_reduce_dim:
+                    continue
                 decoder_args_copy[key] = (
                     int(decoder_args[key] * dim_frac_dec / float(DecoderAttNumHeads)) * DecoderAttNumHeads
                 )
@@ -279,13 +296,12 @@ def pretrain_layers_and_dims(
 
     net_dict = encoder_model.network.get_net()
 
-    if decoder_args["ce_loss_scale"] == 0.0:
-        assert encoder_args["with_ctc"], "CTC loss is not enabled."
-        net_dict["output"] = {"class": "copy", "from": "ctc"}
-        net_dict["decision"]["target"] = "bpe_labels_w_blank"
-        net_dict["decision"]["loss_opts"] = {"ctc_decode": True}
-    else:
-        net_dict.update(decoder_model.network.get_net())
+    # if decoder_args["ce_loss_scale"] == 0.0:
+    #     assert encoder_args["with_ctc"], "CTC loss is not enabled."
+    #     net_dict["output"] = {"class": "copy", "from": "ctc"}
+    #     net_dict["decision"]["target"] = "bpe_labels_w_blank"
+    # else:
+    net_dict.update(decoder_model.network.get_net())
 
     net_dict.update(extra_net_dict)
 
@@ -320,6 +336,7 @@ class ConformerEncoderArgs(EncoderArgs):
     ctc_loss_scale: Optional[float] = None
     ctc_self_align_delay: Optional[int] = None
     ctc_self_align_scale: float = 0.5
+    ctc_dropout: float = 0.0
 
     # param init
     ff_init: Optional[str] = None
@@ -340,10 +357,17 @@ class ConformerEncoderArgs(EncoderArgs):
 
     # other regularization
     l2: float = 0.0001
+    frontend_conv_l2: float = 0.0001
     self_att_l2: float = 0.0
     rel_pos_clipping: int = 16
 
     use_sqrd_relu: bool = False
+
+    # weight noise
+    weight_noise: Optional[float] = None
+    weight_noise_layers: Optional[List[str]] = None
+
+    convolution_first: bool = False
 
 
 class DecoderArgs:
@@ -409,6 +433,7 @@ class ConformerDecoderArgs(DecoderArgs):
 
     # other regularization
     l2: float = 0.0001
+    frontend_conv_l2: float = 0.0001
     rel_pos_clipping: int = 16
     label_smoothing: float = 0.1
     apply_embed_weight: bool = False
@@ -466,6 +491,8 @@ class RNNDecoderArgs(DecoderArgs):
 
     label_smoothing: float = 0.1
 
+    use_zoneout_output: bool = False
+
 
 def create_config(
     training_datasets,
@@ -484,6 +511,7 @@ def create_config(
     accum_grad=2,
     pretrain_reps=5,
     max_seq_length=75,
+    max_seqs=200,
     noam_opts=None,
     warmup_lr_opts=None,
     with_pretrain=True,
@@ -497,6 +525,7 @@ def create_config(
     recog_epochs=None,
     prior_lm_opts=None,
     gradient_noise=0.0,
+    param_variational_noise=None,
     adamw=False,
     retrain_checkpoint=None,
     decouple_constraints_factor=0.025,
@@ -509,12 +538,16 @@ def create_config(
     config_override=None,
     freeze_bn=False,
     keep_all_epochs=False,
-    allow_lr_scheduling=True,
+    allow_lr_scheduling_for_retrain=False,
     learning_rates_list=None,
     min_lr=None,
     global_stats=None,
     speed_pert_version=1,
     specaug_version=1,
+    ctc_greedy_decode=False,
+    joint_ctc_att_decode_args=None,
+    staged_hyperparams: dict = None,
+    keep_best_n=None,
 ):
     exp_config = copy.deepcopy(config)  # type: dict
     exp_post_config = copy.deepcopy(post_config)
@@ -535,9 +568,13 @@ def create_config(
         "accum_grad_multiple_step": accum_grad,
         "gradient_noise": gradient_noise,
         "batch_size": batch_size,
-        "max_seqs": 200,
+        "max_seqs": max_seqs,
         "truncation": -1,
     }
+    if param_variational_noise:
+        assert isinstance(param_variational_noise, float)
+        hyperparams["param_variational_noise"] = param_variational_noise  # applied to all params
+
     # default: Adam optimizer
     hyperparams["adam"] = True
     hyperparams["optimizer_epsilon"] = 1e-8
@@ -556,18 +593,18 @@ def create_config(
     )  # for network construction
 
     # LR scheduling
-    if noam_opts and retrain_checkpoint is None and allow_lr_scheduling:
+    if noam_opts and (retrain_checkpoint is None or allow_lr_scheduling_for_retrain):
         noam_opts["model_d"] = encoder_args.enc_key_dim
         exp_config["learning_rate"] = noam_opts["lr"]
         exp_config["learning_rate_control"] = "constant"
         extra_python_code += "\n" + noam_lr_str.format(**noam_opts)
-    elif warmup_lr_opts and retrain_checkpoint is None and allow_lr_scheduling:
+    elif warmup_lr_opts and (retrain_checkpoint is None or allow_lr_scheduling_for_retrain):
         if warmup_lr_opts.get("learning_rates", None):
             exp_config["learning_rates"] = warmup_lr_opts["learning_rates"]
         exp_config["learning_rate"] = warmup_lr_opts["peak_lr"]
         exp_config["learning_rate_control"] = "constant"
         extra_python_code += "\n" + warmup_lr_str.format(**warmup_lr_opts)
-    elif oclr_opts and retrain_checkpoint is None and allow_lr_scheduling:
+    elif oclr_opts and (retrain_checkpoint is None or allow_lr_scheduling_for_retrain):
         if oclr_opts.get("learning_rates", None):
             exp_config["learning_rates"] = oclr_opts["learning_rates"]
         exp_config["learning_rate"] = oclr_opts["peak_lr"]
@@ -659,19 +696,47 @@ def create_config(
     # add full network
     exp_config["network"] = conformer_encoder.network.get_net()  # type: dict
 
-    if decoder_args["ce_loss_scale"] == 0.0:
-        assert encoder_args["with_ctc"], "CTC loss is not enabled."
-        exp_config["network"]["output"] = {"class": "copy", "from": "ctc"}
-
-        exp_config["extern_data"]["bpe_labels_w_blank"] = copy.deepcopy(exp_config["extern_data"]["bpe_labels"])
-        exp_config["extern_data"]["bpe_labels_w_blank"]["dim"] += 1
-        exp_config["network"]["decision"]["target"] = "bpe_labels_w_blank"
-        exp_config["network"]["decision"]["loss_opts"] = {"ctc_decode": True}
-    else:
-        exp_config["network"].update(transformer_decoder.network.get_net())
+    # if decoder_args["ce_loss_scale"] == 0.0:
+    #     assert encoder_args["with_ctc"], "CTC loss is not enabled."
+    #     exp_config["network"]["output"] = {"class": "copy", "from": "ctc"}
+    #
+    #     exp_config["extern_data"]["bpe_labels_w_blank"] = copy.deepcopy(exp_config["extern_data"]["bpe_labels"])
+    #     exp_config["extern_data"]["bpe_labels_w_blank"]["dim"] += 1
+    #     exp_config["network"]["decision"]["target"] = "bpe_labels_w_blank"
+    #     exp_config["network"]["decision"]["loss_opts"] = {"ctc_decode": True}
+    # else:
+    exp_config["network"].update(transformer_decoder.network.get_net())
 
     if feature_extraction_net:
         exp_config["network"].update(feature_extraction_net)
+
+    if ctc_greedy_decode:
+        # create bpe labels with blank extern data
+        exp_config["extern_data"]["bpe_labels_w_blank"] = copy.deepcopy(exp_config["extern_data"]["bpe_labels"])
+        exp_config["extern_data"]["bpe_labels_w_blank"]["dim"] += 1
+
+        create_ctc_greedy_decoder(exp_config["network"])
+
+        # filter out blanks from best hyp
+        # TODO: we might want to also dump blank for analysis, however, this needs some fix to work.
+        add_filter_blank_and_merge_labels_layers(exp_config["network"])
+        exp_config["network"].pop(exp_config["search_output_layer"], None)
+        exp_config["search_output_layer"] = "out_best_wo_blank"
+
+    if joint_ctc_att_decode_args:
+        # create bpe labels with blank extern data
+        exp_config["extern_data"]["bpe_labels_w_blank"] = copy.deepcopy(exp_config["extern_data"]["bpe_labels"])
+        exp_config["extern_data"]["bpe_labels_w_blank"]["dim"] += 1
+
+        # TODO: this is just for debugging. find a better way to do it later.
+        add_joint_ctc_att_subnet(exp_config["network"], **joint_ctc_att_decode_args)
+        joint_ctc_scale = joint_ctc_att_decode_args["ctc_scale"]
+        if joint_ctc_scale > 0.0:
+            add_filter_blank_and_merge_labels_layers(exp_config["network"])
+            exp_config["network"].pop(exp_config["search_output_layer"], None)
+            exp_config["search_output_layer"] = "out_best_wo_blank"
+        else:
+            pass  # use decision layer as before
 
     # -------------------------- end network -------------------------- #
 
@@ -699,6 +764,10 @@ def create_config(
             python_prolog = specaugment.specaug_tf2.get_funcs()  # type: list
         elif specaug_version == 2:
             python_prolog = specaugment.specaug_v2.get_funcs()
+        elif specaug_version == 3:
+            python_prolog = specaugment.specaug_v3.get_funcs()
+        elif specaug_version == 4:
+            python_prolog = specaugment.specaug_v4.get_funcs()
         else:
             raise ValueError("Invalid specaug_version")
 
@@ -715,6 +784,9 @@ def create_config(
             raise ValueError("Invalid speed_pert_version")
 
     if feature_extraction_net and global_stats:
+        assert os.path.exists(global_stats[0]) and os.path.exists(
+            global_stats[1]
+        ), "global_stats files do not exist. Please run compute_feature_stats first without training."
         exp_config["network"]["log10_"] = copy.deepcopy(exp_config["network"]["log10"])
         exp_config["network"]["global_mean"] = {
             "class": "eval",
@@ -804,11 +876,29 @@ def create_config(
     if keep_all_epochs:
         exp_post_config["cleanup_old_models"] = False
 
+    # it is 4 by default
+    if keep_best_n:
+        exp_post_config["keep_best_n"] = keep_best_n
+
     if extra_str:
         extra_python_code += "\n" + extra_str
 
     if config_override:
         exp_config.update(config_override)
+
+    if joint_ctc_att_decode_args:
+        python_prolog += ["from returnn.tf.compat import v1 as tf_v1"]
+        if joint_ctc_att_decode_args.get("remove_eos", False):
+            python_prolog += [update_tensor_entry]
+
+    # modify hyperparameters based on epoch
+    if staged_hyperparams:
+        for ep, v in staged_hyperparams.items():
+            base_net = copy.deepcopy(exp_config["network"])
+            base_net["#config"] = v
+            assert ep not in staged_hyperparams
+            assert ep > max(staged_hyperparams.keys())
+            staged_network_dict[ep] = base_net
 
     returnn_config = ReturnnConfig(
         exp_config,

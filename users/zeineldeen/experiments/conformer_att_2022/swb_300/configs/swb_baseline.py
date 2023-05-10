@@ -1,5 +1,4 @@
 import copy, os
-import math
 
 from sisyphus import *
 import numpy
@@ -14,21 +13,17 @@ from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.librispeech_
 from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.librispeech_960.additional_config import (
     apply_fairseq_init_to_conformer,
     apply_fairseq_init_to_transformer_decoder,
-    reset_params_init,
 )
 from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.swb_300.data import (
     build_training_datasets,
     build_test_dataset,
 )
 from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.swb_300.default_tools import (
-    RETURNN_EXE,
     RETURNN_ROOT,
     RETURNN_CPU_EXE,
-    NICK_LOGMEL_RETURNN_ROOT,
 )
 from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.swb_300.feature_extraction_net import (
     log10_net_10ms,
-    log10_net_10ms_long_bn,
 )
 from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.swb_300.pipeline import (
     training,
@@ -91,7 +86,6 @@ trafo_lm_opts_map = {
     BPE_5K: trafo_5k_lm_opts,
 }
 
-
 # ----------------------------------------------------------- #
 
 dev_datasets = ["hub5e00"]
@@ -102,7 +96,7 @@ def conformer_baseline():
     abs_name = os.path.abspath(__file__)
     prefix_name = os.path.basename(abs_name)[: -len(".py")]
 
-    def get_test_dataset_tuples(bpe_size, selected_datasets=None):
+    def get_test_dataset_tuples(bpe_size, selected_datasets=None, preemphasis=None):
         test_dataset_tuples = {}
         for testset in ["hub5e00", "hub5e01", "rt03s"]:
             if selected_datasets and testset not in selected_datasets:
@@ -111,6 +105,7 @@ def conformer_baseline():
                 testset,
                 use_raw_features=True,
                 bpe_size=bpe_size,
+                preemphasis=preemphasis,
             )
         return test_dataset_tuples
 
@@ -318,6 +313,8 @@ def conformer_baseline():
 
         search_args = search_args if search_args is not None else train_args
 
+        search_preemphasis = search_args.pop("preemphasis", None)
+
         returnn_search_config = create_config(
             training_datasets=train_data,
             **search_args,
@@ -344,8 +341,10 @@ def conformer_baseline():
         else:
             default_recog_epochs = recog_epochs
 
-        test_dataset_tuples = get_test_dataset_tuples(bpe_size=bpe_size)
-        selected_test_dataset_tuples = get_test_dataset_tuples(bpe_size, selected_datasets=selected_test_datasets)
+        test_dataset_tuples = get_test_dataset_tuples(bpe_size=bpe_size, preemphasis=search_preemphasis)
+        selected_test_dataset_tuples = get_test_dataset_tuples(
+            bpe_size, selected_datasets=selected_test_datasets, preemphasis=search_preemphasis
+        )
 
         for ep in default_recog_epochs:
             search(
@@ -382,6 +381,7 @@ def conformer_baseline():
             test_dataset_tuples,
             RETURNN_CPU_EXE,
             kwargs.get("returnn_root", RETURNN_ROOT),
+            enable_mail=True,
         )
 
     def run_exp(
@@ -425,7 +425,9 @@ def conformer_baseline():
         )
         return train_job, train_data
 
-    def compute_features_stats(bpe_size=500, feature_extraction_net=log10_net_10ms, model_checkpoint=None, **kwargs):
+    def compute_features_stats(
+        output_dirname, feat_dim, bpe_size=500, feature_extraction_net=log10_net_10ms, model_checkpoint=None, **kwargs
+    ):
         train_data = build_training_datasets(
             bpe_size=bpe_size,
             use_raw_features=True,
@@ -466,14 +468,16 @@ def conformer_baseline():
             time_rqmt=72,
             eval_mode=True if model_checkpoint else False,
         )
-        dump_features_job.add_alias("swb_stats/dump_train_log_mel_features")
-        tk.register_output("swb_stats/log_mel_features.hdf", dump_features_job.out_hdf_files[hdf_filename])
+        dump_features_job.add_alias(f"swb_stats/{output_dirname}/dump_train_log_mel_features")
+        tk.register_output(
+            f"swb_stats/{output_dirname}/log_mel_features.hdf", dump_features_job.out_hdf_files[hdf_filename]
+        )
 
         # Extract features stats from HDFDataset
         extract_stats_returnn_config = ReturnnConfig(
             {
                 "extern_data": {
-                    "data": {"dim": 80},
+                    "data": {"dim": feat_dim},
                 },
                 "train": {
                     "class": "HDFDataset",
@@ -490,12 +494,12 @@ def conformer_baseline():
             returnn_python_exe=RETURNN_CPU_EXE,
             returnn_root=kwargs.get("returnn_root", RETURNN_ROOT),
         )
-        extract_mean_stddev_job.add_alias("swb_stats/extract_mean_stddev")
+        extract_mean_stddev_job.add_alias(f"swb_stats/{output_dirname}/extract_mean_stddev")
 
-        tk.register_output("swb_stats/mean_var", extract_mean_stddev_job.out_mean)
-        tk.register_output("swb_stats/std_dev_var", extract_mean_stddev_job.out_std_dev)
-        tk.register_output("swb_stats/mean_file", extract_mean_stddev_job.out_mean_file)
-        tk.register_output("swb_stats/std_dev_file", extract_mean_stddev_job.out_std_dev_file)
+        tk.register_output(f"swb_stats/{output_dirname}/mean_var", extract_mean_stddev_job.out_mean)
+        tk.register_output(f"swb_stats/{output_dirname}/std_dev_var", extract_mean_stddev_job.out_std_dev)
+        tk.register_output(f"swb_stats/{output_dirname}/mean_file", extract_mean_stddev_job.out_mean_file)
+        tk.register_output(f"swb_stats/{output_dirname}/std_dev_file", extract_mean_stddev_job.out_std_dev_file)
 
         return (
             extract_mean_stddev_job.out_mean,
@@ -531,7 +535,7 @@ def conformer_baseline():
         mini_lstm_args["batch_size"] = 20000 * 80
         mini_lstm_args["with_pretrain"] = False
         mini_lstm_args["lr"] = lr
-        mini_lstm_args["allow_lr_scheduling"] = False
+        mini_lstm_args["allow_lr_scheduling_for_retrain"] = False
         mini_lstm_args["encoder_args"].with_ctc = False
         mini_lstm_args["keep_all_epochs"] = True  # keep everything
         mini_lstm_args["extra_str"] = params_freeze_str
@@ -621,7 +625,7 @@ def conformer_baseline():
         mini_self_att["batch_size"] = 20000 * 80  # TODO: does this fit now?
         mini_self_att["with_pretrain"] = False
         mini_self_att["lr"] = lr
-        mini_self_att["allow_lr_scheduling"] = False
+        mini_self_att["allow_lr_scheduling_for_retrain"] = False
         mini_self_att["encoder_args"].with_ctc = False
         # mini_self_att['keep_all_epochs'] = True  # keep everything
         mini_self_att["extra_str"] = params_freeze_str
@@ -674,6 +678,7 @@ def conformer_baseline():
         dropout=0.1,
         att_dropout=0.1,
         l2=0.0001,
+        frontend_conv_l2=0.0001,
     )
     apply_fairseq_init_to_conformer(conformer_enc_args)
     conformer_enc_args.ctc_loss_scale = 1.0
@@ -732,6 +737,10 @@ def conformer_baseline():
 
     # --------------------------- Experiments --------------------------- #
 
+    # - better with global norm
+    # - converge better when not reducing depthwise conv kernel size during pretraining but final WER is worse
+    # - much better with larger batch size initially
+
     oclr_args = copy.deepcopy(lstm_dec_exp_args)
     oclr_args["oclr_opts"] = {
         "peak_lr": 9e-4,
@@ -743,7 +752,9 @@ def conformer_baseline():
     oclr_args["encoder_args"].input_layer = "conv-6"
     oclr_args["encoder_args"].use_sqrd_relu = True
 
-    _, _, mean, stddev = compute_features_stats()
+    _, _, mean, stddev = compute_features_stats(
+        output_dirname="logmel_50", feat_dim=80
+    )  # I found later that feat_dim does not matter. 80 is used here to not break hashes
 
     base_v1_args = copy.deepcopy(oclr_args)
     base_v1_args["global_stats"] = (mean, stddev)
@@ -752,54 +763,9 @@ def conformer_baseline():
     base_v1_args["max_seq_length"] = 75
     base_v1_args["oclr_opts"]["n_step"] = 2012
 
-    # TODO: model layers and dims
-    for enc_layers in [8, 12]:
-        for dim_reduce_factor in [0.7, 1.0]:
-
-            args = copy.deepcopy(base_v1_args)
-            args["encoder_args"].num_blocks = enc_layers
-
-            # reduce dims
-            reduced_att_heads = int(args["encoder_args"].att_num_heads * dim_reduce_factor)
-            enc_key_dim = (
-                int(args["encoder_args"].enc_key_dim * dim_reduce_factor / float(reduced_att_heads)) * reduced_att_heads
-            )
-            args["encoder_args"].enc_key_dim = enc_key_dim
-            args["encoder_args"].ff_dim = 4 * enc_key_dim
-            args["encoder_args"].att_num_heads = reduced_att_heads
-
-            args["encoder_args"].input_layer = f"conv-{6}"
-
-            run_exp(
-                f"base_conf_{enc_layers}l_lstm_1l_conv{6}_sqrdReLU_peak{1e-3}_bs{15000}_bpe500_reps{5}_accum{2}_maxSeqLen75_dimReduce{dim_reduce_factor}_fixedFeat",
-                train_args=args,
-                num_epochs=300,
-                epoch_wise_filter=None,
-                seq_ordering="laplace:6000",
-                selected_test_datasets=dev_datasets,
-            )
-
-            if dim_reduce_factor == 0.7 and enc_layers in [8, 12]:
-                for max_seq_len in [80, 90, 100]:
-                    args["max_seq_length"] = max_seq_len
-                    run_exp(
-                        f"base_conf_{enc_layers}l_lstm_1l_conv{6}_sqrdReLU_peak{1e-3}_bs{15000}_bpe500_reps{5}_accum{2}_maxSeqLen{max_seq_len}_dimReduce{dim_reduce_factor}_fixedFeat",
-                        train_args=args,
-                        num_epochs=300,
-                        epoch_wise_filter=None,
-                        seq_ordering="laplace:6000",
-                        selected_test_datasets=dev_datasets,
-                    )
-
-            # if dim_reduce_factor == 0.7 and enc_layers == 12:
-            #     retrain_args = copy.deepcopy(args)
-            #     retrain_args.pop("oclr_opts")
-            #     retrain_args["learning_rates_list"] = [8e-4] * 6 + list(numpy.linspace(8e-4, 1e-6, 144))
-            #
-
     # best: 8l, 12l with 0.7 dim reduction
 
-    def get_base_args(args, num_blocks, dim_reduce_factor):
+    def get_modified_base_args(args, num_blocks, dim_reduce_factor):
         new_args = copy.deepcopy(args)
         new_args["encoder_args"].num_blocks = num_blocks
         reduced_att_heads = int(new_args["encoder_args"].att_num_heads * dim_reduce_factor)
@@ -811,51 +777,361 @@ def conformer_baseline():
         new_args["encoder_args"].att_num_heads = reduced_att_heads
         return new_args
 
-    base_12l_reduce_0_7_args = get_base_args(base_v1_args, 12, 0.7)
-
-    # TODO: peak lr
-    for final_lr in [1e-5, 1e-6]:
-        for num_epochs in [300]:
-            for peak_lr in [8e-4, 9e-4, 1e-3, 0.0015, 2e-3]:
-                args = copy.deepcopy(base_12l_reduce_0_7_args)
-                # update OCLR
-                args["oclr_opts"]["peak_lr"] = peak_lr
-                args["oclr_opts"]["cycle_ep"] = int(0.45 * num_epochs)
-                args["oclr_opts"]["total_ep"] = num_epochs
-                args["oclr_opts"]["final_lr"] = final_lr
-                run_exp(
-                    f"base_conf_{12}l_lstm_1l_conv{6}_sqrdReLU_peak{peak_lr}_bpe500_maxSeqLen75_dimReduce{0.7}_ep{num_epochs}_finalLR{final_lr}",
-                    train_args=args,
-                    num_epochs=num_epochs,
-                    epoch_wise_filter=None,
-                    seq_ordering="laplace:6000",
-                    selected_test_datasets=dev_datasets,
-                )
-
-    # TODO: more speed pert
-    args = copy.deepcopy(base_12l_reduce_0_7_args)
-    args["speed_pert_version"] = 3
-    run_exp(
-        f"base_conf_{12}l_lstm_1l_conv{6}_sqrdReLU_peak{peak_lr}_bpe500_maxSeqLen75_dimReduce{0.7}_speedPertV3",
-        train_args=args,
-        num_epochs=num_epochs,
+    def run_default_exp(
+        name,
+        train_args,
+        num_epochs=300,
+        bpe_size=500,
         epoch_wise_filter=None,
         seq_ordering="laplace:6000",
-        selected_test_datasets=dev_datasets,
+        feature_extraction_net=log10_net_10ms,
+        search_args=None,
+        **kwargs,
+    ):
+        return run_exp(
+            name,
+            train_args=train_args,
+            num_epochs=num_epochs,
+            bpe_size=bpe_size,
+            epoch_wise_filter=epoch_wise_filter,
+            seq_ordering=seq_ordering,
+            selected_test_datasets=dev_datasets,
+            feature_extraction_net=feature_extraction_net,
+            search_args=search_args,
+            **kwargs,
+        )
+
+    base_12l_reduce_0_7_args = get_modified_base_args(base_v1_args, 12, 0.7)
+    run_default_exp(
+        f"base1_conf_{12}l_lstm_1l_conv{6}_maxSeqLen75_ep{300}",
+        train_args=base_12l_reduce_0_7_args,
+        num_epochs=300,
+    )
+    args = copy.deepcopy(base_12l_reduce_0_7_args)
+    args["max_seq_length"] = None
+    args["oclr_opts"]["n_step"] = 2085
+    run_default_exp(
+        f"base1_conf_{12}l_lstm_1l_conv{6}_ep{300}",
+        train_args=args,
+        num_epochs=300,
+    )
+    args = copy.deepcopy(base_12l_reduce_0_7_args)
+    args["max_seq_length"] = None
+    args["oclr_opts"]["n_step"] = 2085
+    args["oclr_opts"]["cycle_ep"] = int(0.45 * 600)
+    args["oclr_opts"]["total_ep"] = 600
+    run_default_exp(
+        f"base1_conf_{12}l_lstm_1l_conv{6}_ep{600}",
+        train_args=args,
+        num_epochs=600,
+    )
+    # TODO: specaug v2
+    args = copy.deepcopy(base_12l_reduce_0_7_args)
+    args["max_seq_length"] = None
+    args["oclr_opts"]["n_step"] = 2085
+    args["specaug_version"] = 2
+    run_default_exp(
+        f"base1_conf_{12}l_lstm_1l_conv{6}_ep{300}_specaug2",
+        train_args=args,
+        num_epochs=300,
     )
 
-    # TODO: more regularization
-    # for drop_val in [0.1, 0.2, 0.3]:
-    #     args = copy.deepcopy(base_12l_reduce_0_7_args)
+    # TODO: without CTC
+    args = copy.deepcopy(base_12l_reduce_0_7_args)
+    args["encoder_args"].with_ctc = False
+    args["max_seq_length"] = None
+    args["oclr_opts"]["n_step"] = 2085
+    run_default_exp(
+        f"base1_conf_{12}l_lstm_1l_conv{6}_ep{300}_noCTC",
+        train_args=args,
+        num_epochs=300,
+    )
+
+    # base_conf_12l_lstm_1l_conv6_sqrdReLU_peak0.001_bpe500_maxSeqLenNone_dimReduce0.7_ep900
+    # hub5e00: 11.7 - hub5e01: 10.6 - rt03s: 12.2 - ckpt: avg
+    args = copy.deepcopy(base_12l_reduce_0_7_args)
+    args["oclr_opts"]["cycle_ep"] = int(0.45 * 900)
+    args["oclr_opts"]["total_ep"] = 900
+    args["max_seq_length"] = None
+    args["oclr_opts"]["n_step"] = 2085
+    run_default_exp(
+        f"base1_conf_{12}l_lstm_1l_conv{6}_ep{900}",
+        train_args=args,
+        num_epochs=900,
+    )
+    # for peak_lr in [5e-4, 8e-4, 1e-3]:
+    #     for ep in [300, 600, 900]:
+    #         retrain_args = copy.deepcopy(args)
+    #         retrain_args["retrain_checkpoint"] = train_job_avg_ckpt[f"base1_conf_{12}l_lstm_1l_conv{6}_ep{900}"]
+    #         retrain_args["allow_lr_scheduling_for_retrain"] = True
+    #         retrain_args["oclr_opts"]["cycle_ep"] = int(0.45 * ep)
+    #         retrain_args["oclr_opts"]["total_ep"] = ep
+    #         retrain_args["oclr_opts"]["peak_lr"] = peak_lr
+    #         run_default_exp(
+    #             f"base1_conf_{12}l_lstm_1l_conv{6}_peak{peak_lr}_ep{ep}_retrain1",
+    #             train_args=retrain_args,
+    #             num_epochs=ep,
+    #         )
     #
+    # # TODO: retrain with more speed perturbation
+    # for peak_lr in [1e-3, 2e-3]:
+    #     retrain_args = copy.deepcopy(args)
+    #     retrain_args["retrain_checkpoint"] = train_job_avg_ckpt[f"base1_conf_{12}l_lstm_1l_conv{6}_ep{900}"]
+    #     retrain_args["allow_lr_scheduling_for_retrain"] = True
+    #     retrain_args["oclr_opts"]["cycle_ep"] = int(0.45 * 300)
+    #     retrain_args["oclr_opts"]["total_ep"] = 300
+    #     retrain_args["oclr_opts"]["peak_lr"] = peak_lr
+    #
+    #     retrain_args["encoder_args"].frontend_conv_l2 = 1e-2
+    #     retrain_args["encoder_args"].att_dropout = 0.3
+    #     retrain_args["encoder_args"].dropout = 0.3
+    #     retrain_args["gradient_noise"] = 0.01
+    #
+    #     # more
+    #     retrain_args["speed_pert_version"] = 3
+    #
+    #     run_default_exp(
+    #         f"base1_conf_{12}l_lstm_1l_conv{6}_peak{peak_lr}_ep{300}_drop{0.3}_speedPertV3_convL2{1e-2}_gradNoise{0.01}_retrain1",
+    #         train_args=retrain_args,
+    #         num_epochs=300,
+    #     )
 
-    # TODO: longer training
+    # retrain_args = copy.deepcopy(args)
+    # retrain_args["retrain_checkpoint"] = train_job_avg_ckpt[f"base1_conf_{12}l_lstm_1l_conv{6}_ep{900}"]
+    # retrain_args["allow_lr_scheduling_for_retrain"] = True
+    # retrain_args["oclr_opts"]["cycle_ep"] = int(0.45 * 300)
+    # retrain_args["oclr_opts"]["total_ep"] = 300
+    # retrain_args["oclr_opts"]["peak_lr"] = 1e-3
+    #
+    # retrain_args["encoder_args"].frontend_conv_l2 = 1e-2
+    # retrain_args["encoder_args"].att_dropout = 0.3
+    # retrain_args["encoder_args"].dropout = 0.3
+    # retrain_args["gradient_noise"] = 0.01
+    #
+    # # more
+    # retrain_args["specaug_version"] = 2
+    #
+    # run_default_exp(
+    #     f"base1_conf_{12}l_lstm_1l_conv{6}_peak{1e-3}_ep{300}_drop{0.3}_specaug2_convL2{1e-2}_gradNoise{0.01}_retrain1",
+    #     train_args=retrain_args,
+    #     num_epochs=300,
+    # )
 
-    # TODO: tune max_seq_len
-    # 90 -> Dropped seqs: 660 (0.26%)
-    # 100 ->Dropped seqs: 149 (0.06%)
-    # for max_seq_len in [90, 100]:
-    #     args = copy.deepcopy(base_v1_args)
-    #     args["max_seq_length"] = max_seq_len
-    #     name = f"base_conf_12l_lstm_1l_conv4_sqrdReLU_peak{1e-3}_bs{15000}_bpe500_reps{5}_accum{2}_noCurr_laplace:6000_maxSeqLen{max_seq_len}"
-    #     run_exp(name, train_args=args, num_epochs=300, epoch_wise_filter=None, seq_ordering="laplace:6000")
+    # # retrain
+    # for ep in [300]:
+    #     for peak_lr in [1e-3]:
+    #         for drop in [0.1, 0.2, 0.3]:
+    #             for dec_att_drop in [0.0, drop]:
+    #                 retrain_args = copy.deepcopy(base_12l_reduce_0_7_args)
+    #                 retrain_args["oclr_opts"]["cycle_ep"] = int(0.45 * ep)
+    #                 retrain_args["oclr_opts"]["total_ep"] = ep
+    #                 retrain_args["oclr_opts"]["peak_lr"] = peak_lr
+    #                 retrain_args["max_seq_length"] = None
+    #                 retrain_args["oclr_opts"]["n_step"] = 2085
+    #
+    #                 # add regularization
+    #                 retrain_args["encoder_args"].att_dropout = drop
+    #                 retrain_args["encoder_args"].dropout = drop
+    #                 retrain_args["decoder_args"].embed_dropout = drop
+    #
+    #                 retrain_args["decoder_args"].att_dropout = dec_att_drop
+    #                 retrain_args["decoder_args"].use_zoneout_output = True
+    #
+    #                 retrain_args["retrain_checkpoint"] = train_job_avg_ckpt[f"base1_conf_{12}l_lstm_1l_conv{6}_ep{900}"]
+    #
+    #                 retrain_args["allow_lr_scheduling_for_retrain"] = True
+    #
+    #                 name = f"base1_conf_{12}l_lstm_1l_conv{6}_ep{ep}_drop{drop}_decAttDrop{dec_att_drop}_fixedZoneout"
+    #                 name += "_retrain1"
+    #                 run_default_exp(
+    #                     name=name,
+    #                     train_args=retrain_args,
+    #                     num_epochs=ep,
+    #                 )
+
+    args = copy.deepcopy(base_12l_reduce_0_7_args)
+    args["pretrain_reps"] = 3
+    args["pretrain_opts"]["ignored_keys_for_reduce_dim"] = ["conv_kernel_size"]
+    args["max_seq_length"] = None
+    args["decoder_args"].use_zoneout_output = True  # should be more regs
+    args["oclr_opts"]["n_step"] = 2085
+    args["oclr_opts"]["cycle_ep"] = int(0.45 * 900)
+    args["oclr_opts"]["total_ep"] = 900
+    run_default_exp(
+        f"base1_conf_{12}l_lstm_1l_conv{6}_woDepthwiseConvPre_preReps{3}_fixedZoneout_ep900",
+        train_args=args,
+        num_epochs=900,
+    )
+
+    args = copy.deepcopy(base_v1_args)
+    args["pretrain_reps"] = 3
+    args["pretrain_opts"]["ignored_keys_for_reduce_dim"] = ["conv_kernel_size"]
+    args["max_seq_length"] = None
+    args["decoder_args"].use_zoneout_output = True  # should be more regs
+    args["oclr_opts"]["n_step"] = 2085
+    args["oclr_opts"]["cycle_ep"] = int(0.45 * 900)
+    args["oclr_opts"]["total_ep"] = 900
+    run_default_exp(
+        f"base1_conf_{12}l_lstm_1l_conv{6}_dimReduce{1.0}_woDepthwiseConvPre_preReps{3}_fixedZoneout_ep900",
+        train_args=args,
+        num_epochs=900,
+    )
+
+    args = copy.deepcopy(base_12l_reduce_0_7_args)
+    args["max_seq_length"] = None
+    args["decoder_args"].use_zoneout_output = True  # should be more regs
+    args["oclr_opts"]["n_step"] = 2085
+    args["oclr_opts"]["cycle_ep"] = int(0.45 * 900)
+    args["oclr_opts"]["total_ep"] = 900
+    run_default_exp(
+        f"base1_conf_{12}l_lstm_1l_conv{6}_fixedZoneout_ep600",
+        train_args=args,
+        num_epochs=900,
+    )
+
+    # TODO: gradient noise
+    for disable_in_pretrain in [True, False]:
+        for grad_noise in [1e-2, 1e-3, 1e-4]:
+            args = copy.deepcopy(base_12l_reduce_0_7_args)
+            args["max_seq_length"] = None
+            args["decoder_args"].use_zoneout_output = True
+            args["oclr_opts"]["n_step"] = 2085
+            args["gradient_noise"] = grad_noise
+            name = f"base1_conf_{12}l_lstm_1l_conv{6}_fixedZoneout_ep300_gradNoise{grad_noise}"
+            if disable_in_pretrain:
+                args["pretrain_opts"]["extra_net_dict_override"] = {"gradient_noise": 0.0}
+                name += "_disablePre"
+            run_default_exp(
+                name,
+                train_args=args,
+                num_epochs=300,
+            )
+
+    # TODO: variational noise
+    for disable_in_pretrain in [False]:
+        for param_var_noise in [1e-2, 1e-3, 1e-4]:
+            args = copy.deepcopy(base_12l_reduce_0_7_args)
+            args["max_seq_length"] = None
+            args["decoder_args"].use_zoneout_output = True
+            args["oclr_opts"]["n_step"] = 2085
+            args["encoder_args"].weight_noise = param_var_noise
+            args["encoder_args"].weight_noise_layers = ["mhsa"]
+            name = f"base1_conf_{12}l_lstm_1l_conv{6}_fixedZoneout_ep300_weightNoiseMHSA{param_var_noise}"
+            if disable_in_pretrain:
+                args["pretrain_opts"]["extra_net_dict_override"] = {"param_variational_noise": None}
+                name += "_disablePre"
+            run_default_exp(
+                name,
+                train_args=args,
+                num_epochs=300,
+            )
+
+    # lbs
+    for lbs in [0.15, 0.2]:
+        args = copy.deepcopy(base_12l_reduce_0_7_args)
+        args["max_seq_length"] = None
+        args["decoder_args"].use_zoneout_output = True
+        args["decoder_args"].label_smoothing = lbs
+        args["oclr_opts"]["n_step"] = 2085
+        name = f"base1_conf_{12}l_lstm_1l_conv{6}_fixedZoneout_ep300_lbs{lbs}"
+        run_default_exp(
+            name,
+            train_args=args,
+            num_epochs=300,
+        )
+
+    # staged hyperparams
+    # args = copy.deepcopy(base_12l_reduce_0_7_args)
+    # args["max_seq_length"] = None
+    # args["decoder_args"].use_zoneout_output = True
+    # args["oclr_opts"]["n_step"] = 2085
+    # args["staged_hyperparams"] = {}
+    # name = f"base_conf_{12}l_lstm_1l_conv{6}_sqrdReLU_bpe500_maxSeqLenNone_dimReduce{0.7}_fixedZoneout_ep300"
+    # run_default_exp(
+    #     name,
+    #     train_args=args,
+    #     num_epochs=300,
+    # )
+
+    # train with bpe 1k
+    args = copy.deepcopy(base_12l_reduce_0_7_args)
+    args["max_seq_length"] = None
+    args["oclr_opts"]["n_step"] = 2085
+    args["decoder_args"].use_zoneout_output = True
+    run_default_exp(
+        name="base1_conf_12l_lstm_1l_conv6_bpe1k_fixedZoneout_ep300",
+        train_args=args,
+        num_epochs=300,
+        bpe_size=1000,
+    )
+
+    # ----------------------------------------------- #
+
+    # base_conf_12l_lstm_1l_conv6_sqrdReLU_bpe500_maxSeqLenNone_dimReduce0.7_woDepthwiseConvPre_preReps3_drop0.2_fixedZoneout_l20.0001_ep600
+    # hub5e00: 12 - hub5e01: 10.5 - rt03s: 12.5 - ckpt: best
+    base_v2_args = copy.deepcopy(base_12l_reduce_0_7_args)
+    base_v2_args["pretrain_reps"] = 3
+    base_v2_args["pretrain_opts"]["ignored_keys_for_reduce_dim"] = ["conv_kernel_size"]
+    base_v2_args["max_seq_length"] = None
+    base_v2_args["oclr_opts"]["cycle_ep"] = int(0.45 * 600)
+    base_v2_args["oclr_opts"]["total_ep"] = 600
+    base_v2_args["oclr_opts"]["n_step"] = 2085
+    base_v2_args["encoder_args"].att_dropout = 0.2
+    base_v2_args["encoder_args"].dropout = 0.2
+    base_v2_args["decoder_args"].use_zoneout_output = True
+    run_default_exp(
+        f"base2_conf_{12}l_lstm_1l_conv{6}_ep{600}",
+        train_args=base_v2_args,
+        num_epochs=600,
+    )
+
+    args = copy.deepcopy(base_v2_args)
+    args["encoder_args"].with_ctc = False
+    run_default_exp(
+        f"base2_conf_{12}l_lstm_1l_conv{6}_ep{600}_noCTC",
+        train_args=args,
+        num_epochs=600,
+    )
+
+    # TODO: more specaug
+    for specaug_version in [2, 3]:
+        args = copy.deepcopy(base_v2_args)
+        args["specaug_version"] = specaug_version
+        run_default_exp(
+            f"base2_conf_{12}l_lstm_1l_conv{6}_ep{600}_specaug{specaug_version}",
+            train_args=args,
+            num_epochs=600,
+        )
+
+    args = copy.deepcopy(base_v2_args)
+    args["oclr_opts"]["cycle_ep"] = int(0.45 * 900)
+    args["oclr_opts"]["total_ep"] = 900
+    run_default_exp(
+        f"base2_conf_{12}l_lstm_1l_conv{6}_ep{900}",
+        train_args=args,
+        num_epochs=900,
+    )
+
+    for ep in [600, 900]:
+        args = copy.deepcopy(base_v2_args)
+        args["decoder_args"].att_dropout = 0.2
+        args["decoder_args"].embed_dropout = 0.2
+        args["oclr_opts"]["cycle_ep"] = int(0.45 * ep)
+        args["oclr_opts"]["total_ep"] = ep
+        run_default_exp(
+            f"base2_conf_{12}l_lstm_1l_conv{6}_decAttDrop{0.2}_embedDrop{0.2}_ep{ep}",
+            train_args=args,
+            num_epochs=ep,
+        )
+
+    # TODO: swap mhsa and conv
+    for ep in [600]:
+        args = copy.deepcopy(base_v2_args)
+        args["oclr_opts"]["cycle_ep"] = int(0.45 * ep)
+        args["oclr_opts"]["total_ep"] = ep
+        args["encoder_args"].convolution_first = True
+        run_default_exp(
+            f"base2_conf_{12}l_lstm_1l_conv{6}_ep{ep}_convFirst",
+            train_args=args,
+            num_epochs=ep,
+        )

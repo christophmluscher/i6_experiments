@@ -12,20 +12,17 @@ from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.librispeech_
 from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.librispeech_960.additional_config import (
     apply_fairseq_init_to_conformer,
     apply_fairseq_init_to_transformer_decoder,
-    reset_params_init,
 )
 from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.librispeech_960.data import (
     build_training_datasets,
     build_test_dataset,
 )
 from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.librispeech_960.default_tools import (
-    RETURNN_EXE,
     RETURNN_ROOT,
     RETURNN_CPU_EXE,
 )
 from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.librispeech_960.feature_extraction_net import (
     log10_net_10ms,
-    log10_net_10ms_long_bn,
 )
 from i6_experiments.users.zeineldeen.experiments.conformer_att_2022.librispeech_960.pipeline import (
     training,
@@ -166,6 +163,7 @@ def conformer_baseline():
             returnn_root=RETURNN_ROOT,
             mem_rqmt=mem_rqmt,
             time_rqmt=time_rqmt,
+            **kwargs,
         )
 
     def run_lm_fusion(
@@ -474,7 +472,7 @@ def conformer_baseline():
         mini_lstm_args["batch_size"] = 20000 * 160
         mini_lstm_args["with_pretrain"] = False
         mini_lstm_args["lr"] = lr
-        mini_lstm_args["allow_lr_scheduling"] = False
+        mini_lstm_args["allow_lr_scheduling_for_retrain"] = False
         mini_lstm_args["encoder_args"].with_ctc = False
         mini_lstm_args["keep_all_epochs"] = True  # keep everything
         mini_lstm_args["extra_str"] = params_freeze_str
@@ -576,7 +574,7 @@ def conformer_baseline():
         mini_self_att["batch_size"] = 20000 * 160  # TODO: does this fit now?
         mini_self_att["with_pretrain"] = False
         mini_self_att["lr"] = lr
-        mini_self_att["allow_lr_scheduling"] = False
+        mini_self_att["allow_lr_scheduling_for_retrain"] = False
         mini_self_att["encoder_args"].with_ctc = False
         # mini_self_att['keep_all_epochs'] = True  # keep everything
         mini_self_att["extra_str"] = params_freeze_str
@@ -634,6 +632,7 @@ def conformer_baseline():
         dropout=0.1,
         att_dropout=0.1,
         l2=0.0001,
+        frontend_conv_l2=0.0001,
     )
     apply_fairseq_init_to_conformer(conformer_enc_args)
     conformer_enc_args.ctc_loss_scale = 1.0
@@ -735,12 +734,18 @@ def conformer_baseline():
         bpe_size=BPE_1K,
     )
 
-    # Wo LM:
+    # Wo LM with best
     #
     # dev-clean  2.28
     # dev-other  5.63
     # test-clean  2.48
     # test-other  5.71
+    #
+    # with Avg:
+    # dev-clean 2.28
+    # dev-other 5.60
+    # test-clean 2.48
+    # test-other 5.75
 
     name = "base_conf_12l_lstm_1l_conv6_OCLR_sqrdReLU_cyc915_ep2035_peak0.0009"
     train_j, train_data = run_exp(name, train_args=oclr_args, num_epochs=2035)
